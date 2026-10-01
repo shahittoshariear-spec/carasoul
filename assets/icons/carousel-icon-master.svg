@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<defs>
+<linearGradient id="hg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#00E8FF"/><stop offset="1" stop-color="#8A5CF0"/></linearGradient>
+<radialGradient id="hb" cx=".32" cy=".28" r=".95"><stop offset="0" stop-color="#161B3E"/><stop offset="1" stop-color="#0A0E27"/></radialGradient>
+<polygon id="hex" points="256,72 404,161 404,331 256,420 108,331 108,161"/>
+</defs>
+<rect width="512" height="512" fill="url(#hb)"/>
+<use href="#hex" fill="none" stroke="#262B5C" stroke-width="5"/>
+<use href="#hex" fill="none" stroke="url(#hg)" stroke-width="3" transform="scale(.84)" transform-origin="256 256"/>
+<path d="M178 200a106 106 0 0 1 158-19" fill="none" stroke="#00E8FF" stroke-width="23" stroke-linecap="round"/>
+<path d="M334 312a106 106 0 0 1-158 19" fill="none" stroke="#FF3DDB" stroke-width="23" stroke-linecap="round"/>
+<path d="M320 165l46 27-44 31z" fill="#00E8FF"/><path d="M192 347l-46-27 44-31z" fill="#FF3DDB"/>
+<circle cx="256" cy="256" r="11" fill="#FFC24D"/>
+</svg>
