@@ -343,6 +343,10 @@ struct App {
     overlay: sys::Overlay,
     input: sys::Input,
     strip: Strip,
+    /// The display the shelf is on, and therefore the one a commit applies to.
+    /// Windows takes a wallpaper **per monitor**, and the shelf follows the
+    /// pointer, so this is what keeps the two screens independent.
+    monitor: sys::ScreenRect,
     layout: Layout,
     lib: Library,
     palette: Palette,
@@ -431,17 +435,20 @@ impl App {
     }
 
     /// Points the shelf at the display the pointer is on, and sizes the prepared
-    /// wallpaper copies to match. Windows paints the one wallpaper across every
-    /// monitor, but the shelf is only ever a band on one of them — the one being
-    /// worked on — so on a mixed setup (a widescreen plus a portrait panel, say)
-    /// both the band and the copy Windows is handed are built for that display
-    /// rather than for whichever monitor happened to hold the pointer at launch.
+    /// wallpaper copies to match. Windows takes a wallpaper per monitor, and the
+    /// shelf is a band on one of them, so on a two-screen desk each monitor
+    /// keeps its own image: whichever screen the shelf is opened on is the one a
+    /// commit lands on.
     ///
-    /// Returns true when the band moved or changed size, i.e. when what is on
-    /// screen no longer reflects the strip that was just computed.
+    /// Returns true when the target display itself changed.
     fn retarget_monitor(&mut self) -> bool {
         let mon = sys::monitor_rect_at(sys::cursor_pos());
         let strip = strip_for(mon);
+        let changed = mon.x != self.monitor.x
+            || mon.y != self.monitor.y
+            || mon.w != self.monitor.w
+            || mon.h != self.monitor.h;
+        self.monitor = mon;
 
         // The copies are handed to Windows for the display being filled, so their
         // size follows the display the pointer is on. A copy built for the other
@@ -453,26 +460,28 @@ impl App {
 
         let moved = strip.x != self.strip.x || strip.y != self.strip.y;
         let resized = strip.w != self.strip.w || strip.h != self.strip.h;
-        if !moved && !resized {
-            return false;
+        if moved || resized {
+            self.overlay.hide();
+            self.showing = false;
+            // If the resize fails, keep the old band rather than paint into a
+            // bitmap of the wrong size; the next open will try again.
+            if !resized || self.overlay.resize(strip.w, strip.h).is_ok() {
+                self.strip = strip;
+                self.layout = make_layout(&self.strip);
+                self.needs_paint = true;
+            }
         }
-        self.overlay.hide();
-        self.showing = false;
-        if resized && self.overlay.resize(strip.w, strip.h).is_err() {
-            // Better to keep the old band than to paint into a bitmap of the wrong
-            // size; the next open will try again.
-            return false;
-        }
-        self.strip = strip;
-        self.layout = make_layout(&self.strip);
-        self.needs_paint = true;
-        true
+        changed
     }
 
     fn open_strip(&mut self, pinned: bool) {
         // Follow the pointer first, so a shelf opened on the second monitor is
         // built (and its copies sized) for that monitor from the very first frame.
-        self.retarget_monitor();
+        if self.retarget_monitor() {
+            // And start it on what that monitor already has, so the two screens
+            // do not end up sharing a selection.
+            self.follow_monitor_wallpaper();
+        }
         // Re-read the folder here rather than watching it: someone who drops an
         // image in and holds Shift should see it, and this costs one directory
         // listing when nothing has changed.
@@ -504,6 +513,18 @@ impl App {
         if let Some(a) = self.lib.accent(self.target_idx) {
             self.accent = Color::from_rgb8(a[0], a[1], a[2]);
             self.accent_target = self.accent;
+        }
+    }
+
+    /// Points the carousel at the wallpaper the shelf's display already has.
+    /// Opening on the second monitor starts from the second monitor's image,
+    /// not from whatever was last picked on the first.
+    fn follow_monitor_wallpaper(&mut self) {
+        let Some(cur) = sys::monitor_wallpaper(self.monitor) else {
+            return;
+        };
+        if let Some(idx) = self.lib.index_of(&cur) {
+            self.select(idx);
         }
     }
 
@@ -657,6 +678,7 @@ impl App {
         let path = item.path.clone();
         let accent = item.accent;
         let (rw, rh) = (self.ready_w, self.ready_h);
+        let mon = self.monitor;
         std::thread::Builder::new()
             .name("apply".into())
             .spawn(move || {
@@ -664,7 +686,12 @@ impl App {
                 // Nearly always already there: the worker prepares each card as it
                 // is decoded, and the one the user lands on is requested first.
                 let ready = library::ready_for(&path, rw, rh);
-                sys::set_wallpaper(ready.as_deref().unwrap_or(&path));
+                let target = ready.as_deref().unwrap_or(&path);
+                // One display at a time; the global call is the fallback for a
+                // shell that has no per-monitor API to offer.
+                if !sys::set_monitor_wallpaper(mon, target) {
+                    sys::set_wallpaper(target);
+                }
                 if let Some(a) = accent {
                     sys::apply_accent((a[0], a[1], a[2]));
                 }
@@ -1176,8 +1203,9 @@ fn usage() {
            --dir <path>      wallpaper folder (default: <exe>/wallpapers)\n\
            --no-autostart    do not register the Windows startup entry\n\
            --uninstall       remove the startup entry and exit\n\
-           --list            list wallpapers with their index and exit\n\
-           --apply <index>   apply one wallpaper + its accent colour and exit\n\
+           --list            list wallpapers with their index and exit
+           --apply <index>   apply one wallpaper + its accent colour and exit
+           --monitors        list displays + the wallpaper on each and exit
            --preview         hold the shelf open on startup (UI testing)\n\
            --demo            preview + auto-cycles and prints frame timings\n\
            -h, --help        this text"
@@ -1192,13 +1220,20 @@ fn main() {
     let mut list = false;
     let mut preview = false;
     let mut demo = false;
+    let mut monitors = false;
 
     // The modes that print borrow the console they were launched from: this is
     // linked as a GUI app (see the crate docs), so it has none of its own.
     if args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "-h" | "--help" | "--list" | "--apply" | "--demo" | "--preview" | "--uninstall"
+            "-h" | "--help"
+                | "--list"
+                | "--apply"
+                | "--demo"
+                | "--preview"
+                | "--uninstall"
+                | "--monitors"
         )
     }) {
         sys::attach_parent_console();
@@ -1218,6 +1253,7 @@ fn main() {
                 return;
             }
             "--list" => list = true,
+            "--monitors" => monitors = true,
             "--preview" => preview = true,
             "--demo" => {
                 demo = true;
@@ -1234,6 +1270,14 @@ fn main() {
             other => eprintln!("ignoring unknown argument: {other}"),
         }
         i += 1;
+    }
+
+    if monitors {
+        for rect in sys::wallpaper_monitors() {
+            let cur = sys::monitor_wallpaper(rect).unwrap_or_else(|| "(none)".to_string());
+            println!("{:>6},{:>6}  {}x{}  {}", rect.x, rect.y, rect.w, rect.h, cur);
+        }
+        return;
     }
 
     let current = sys::current_wallpaper();
@@ -1279,6 +1323,9 @@ fn main() {
     }
 
     let mon = sys::monitor_rect_at(sys::cursor_pos());
+    // Start focused on what this display already has; a monitor that has never
+    // been given a wallpaper of its own reports the global image instead.
+    let current = sys::monitor_wallpaper(mon).or(current);
     let strip = strip_for(mon);
     let layout = make_layout(&strip);
 
@@ -1318,6 +1365,7 @@ fn main() {
         overlay,
         input: sys::Input::new(),
         strip,
+        monitor: mon,
         layout,
         lib,
         palette: palette_for(accent),

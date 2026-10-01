@@ -79,11 +79,13 @@ Details that matter:
   waits for Enter or a click, and Esc (or a click on the shelf) still cancels.
   Choosing **Next wallpaper** while it is open just rotates the carousel, since
   that reads as browsing rather than as an instruction to land.
-- The shelf opens on the display the **pointer** is on, not the one it was
-  launched on, so on two monitors you can hold Shift on either of them. On a
-  **portrait** monitor the cards are sized from the monitor's short side (its
-  width), which keeps the shelf in proportion instead of stretching top to
-  bottom.
+- Each monitor keeps its **own wallpaper**. The shelf opens on the display the
+  **pointer** is on, and what you land on is applied to that display alone, so
+  holding Shift on the second monitor sets the second monitor and leaves the
+  first untouched. Reopening on a screen starts from the image that screen
+  already has. On a **portrait** monitor the cards are sized from the monitor's
+  short side (its width), which keeps the shelf in proportion instead of
+  stretching top to bottom.
 
 ## Project layout
 
@@ -270,13 +272,23 @@ no frame of either morph leaves the band.
 
 ### Applying a wallpaper
 
-`SystemParametersInfoW(SPI_SETDESKWALLPAPER)` plus the accent registry values and
-a `WM_DWMCOLORIZATIONCOLORCHANGED` broadcast. Both are slow — the broadcast alone
-can take hundreds of milliseconds, and Windows transcodes the image it is given
-before any of it reaches the desktop — so they run on a **separate thread**,
-letting the overlay finish its animation while the desktop changes behind it. That
-thread starts as the pour begins, so the wallpaper is already changing as the
-liquid leaves.
+The shell's **per-monitor** wallpaper interface (`IDesktopWallpaper`) plus the
+accent registry values and a `WM_DWMCOLORIZATIONCOLORCHANGED` broadcast. The
+interface is addressed by display, which is what makes the two monitors
+independent: the shelf is a band on one screen, and the image it lands on is set
+on that screen alone, leaving the other exactly as it was. If COM or the
+interface is unavailable — an OS older than Windows 8, or a failure — the app
+falls back to `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`, which is the old
+behaviour: one image on every monitor.
+
+The accent colour is the one thing still shared: Windows has a single accent, so
+it follows whichever display was applied last.
+
+The broadcast is the slow part — hundreds of milliseconds — and Windows
+transcodes the image it is given before any of it reaches the desktop, so the
+apply runs on a **separate thread**, letting the overlay finish its animation
+while the desktop changes behind it. That thread starts as the pour begins, so
+the wallpaper is already changing as the liquid leaves.
 
 The transcoding is the part that used to be felt: a 4K PNG is seconds of work,
 and all of it landed *after* the pour had finished. So the wallpaper Windows is
@@ -308,12 +320,10 @@ bigger than the screen — a copy of an image that Windows would have to *upscal
 anyway adds a second JPEG generation for nothing, so small wallpapers are handed
 over untouched.
 
-The size a monitor copy is built for is the display the pointer is on when the
-shelf opens (and again whenever the monitor layout changes), so the copy follows
-you from one screen to the other instead of being frozen at the one from launch.
-Windows paints the single wallpaper across every monitor with the chosen fit, so
-on a mixed landscape/portrait pair the copy can only be exact for the display it
-was sized for; the other crops it.
+The size a monitor copy is built for is the display the shelf is on — the one
+the commit will land on — so the portrait panel gets a 1080x1920 copy and the
+widescreen gets a 1920x1080 one, each fitted to the screen it is actually shown
+on instead of being cropped to fit the other.
 
 ## Performance
 
@@ -496,7 +506,8 @@ Two IExpress quirks are worth knowing if the packaging is ever touched:
 ```
 carasoul                      run it (registers the startup entry)
 carasoul --list               list wallpapers with their index
-carasoul --apply 3            apply index 3 + its accent, no UI
+carasoul --apply 3            apply index 3 + its accent to every monitor, no UI
+carasoul --monitors           list displays + the wallpaper on each, then exit
 carasoul --preview            hold the shelf open (UI testing, no tray icon)
 carasoul --demo               preview + auto-cycle + print frame timings
 carasoul --dir "D:\Art"       use another folder
@@ -512,6 +523,12 @@ are ways to look at the shelf, not to run the app.
 `--demo` also drives navigation through the same hook → pending-bits path a
 keyboard uses, so it doubles as a test of the input wiring. It prints the number
 of hotkeys claimed and whether the hook installed.
+
+`--monitors` is the diagnostic for the per-monitor setup: one line per display
+with its position, size and current wallpaper, straight from the shell. If the
+shelf lands on the wrong screen, compare that list with where the shelf appears.
+`--apply` deliberately uses the **global** call, so it puts the one image on
+every monitor; the per-monitor path is what the shelf itself uses.
 
 ## Wallpapers
 
@@ -586,15 +603,17 @@ The look is a handful of constants, all of them named:
 
 ## Gotchas and limitations
 
-- **Multiple monitors, one wallpaper.** The shelf appears on whichever display
-  holds the pointer when it opens — a portrait panel included, where the cards
-  are sized from the monitor's short side — and the prepared copy handed to
-  Windows is sized for that same display. Windows still applies a single
-  wallpaper to all of them, though, so with displays of different shapes the
-  other monitor crops that copy rather than the original. It fills correctly;
-  it is just one JPEG generation from an image already cropped once. The shell's
-  simple wallpaper call only takes one file, so there is no way to hand it a
-  copy per monitor without going through the slideshow plumbing instead.
+- **Two monitors, two wallpapers.** Each display keeps its own image, set
+  through the shell's `IDesktopWallpaper` interface and remembered by Windows
+  across restarts. The shelf applies to whichever display it was opened on, and
+  the prepared copy is sized for that same display. Two things are still
+  shared: the **accent colour**, which follows whichever monitor was applied
+  last because Windows only has one, and `--apply` on the command line, which is
+  the global call and puts one image on every monitor (handy as a reset,
+  surprising if you did not mean it).
+- **The per-monitor API can be missing.** It exists from Windows 8 on. If COM or
+  the interface is unavailable the app falls back to the global
+  `SPI_SETDESKWALLPAPER` call, which is the old behaviour: one image everywhere.
 - **The prepared copies are disk, not memory.** Roughly 0.9 MB per wallpaper ever
   *shown* — ~0.3 MB of lossless card copy plus ~0.6 MB of monitor-sized copy — in
   `%LOCALAPPDATA%\carasoul\cache`. Monitor copies are only made for the cards

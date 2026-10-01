@@ -5,7 +5,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GENERIC_WRITE, HINSTANCE, HWND,
     LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
@@ -20,6 +20,9 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::Console::{
     AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -32,6 +35,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
 };
+use windows::Win32::UI::Shell::{DesktopWallpaper, IDesktopWallpaper, DWPOS_FILL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetAncestor,
     GetClassNameW, GetCursorPos, GetForegroundWindow, LoadCursorW, PeekMessageW, PostMessageW,
@@ -859,20 +863,22 @@ pub fn current_wallpaper() -> Option<String> {
     }
 }
 
-/// Applies the wallpaper, stretched to fill, and tells the shell.
-pub fn set_wallpaper(path: &Path) -> bool {
-    let full = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => path.to_path_buf(),
-    };
+/// The plain absolute path both wallpaper APIs want: canonical where possible,
+/// and without the `\\?\` prefix that confuses the shell.
+fn wallpaper_path(path: &Path) -> String {
+    let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = full.to_string_lossy().to_string();
-    // \\.\ style prefixes confuse SPI; a plain absolute path is what it wants.
-    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+}
 
+/// Applies the wallpaper to **every** monitor, stretched to fill, and tells the
+/// shell. The per-monitor call below is what the shelf uses; this is the
+/// fallback for when the shell has no per-monitor API to offer.
+pub fn set_wallpaper(path: &Path) -> bool {
     reg_set_str(r"Control Panel\Desktop", "WallpaperStyle", "10"); // 10 = fill
     reg_set_str(r"Control Panel\Desktop", "TileWallpaper", "0");
 
-    let mut w = wide(&text);
+    let mut w = wide(&wallpaper_path(path));
     unsafe {
         SystemParametersInfoW(
             SPI_SETDESKWALLPAPER,
@@ -881,6 +887,123 @@ pub fn set_wallpaper(path: &Path) -> bool {
             SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
         )
         .is_ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-monitor wallpapers
+// ---------------------------------------------------------------------------
+
+/// The shell's per-monitor wallpaper object (`IDesktopWallpaper`, Windows 8+).
+/// `None` when COM or the object itself is unavailable, which the callers treat
+/// as "fall back to the one global wallpaper".
+fn desktop_wallpaper() -> Option<IDesktopWallpaper> {
+    unsafe {
+        // Per-thread COM init; S_FALSE (already done) and RPC_E_CHANGED_MODE
+        // (done in the other apartment) both mean it is fine to carry on.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL).ok()
+    }
+}
+
+/// COM hands strings back allocated with CoTaskMemAlloc; copy, then free.
+fn take_pwstr(p: PWSTR) -> String {
+    let s = unsafe { p.to_string() }.unwrap_or_default();
+    unsafe {
+        CoTaskMemFree(Some(p.0 as *const c_void));
+    }
+    s
+}
+
+/// Every display, in the shell's own order. The device paths the shell uses to
+/// address them only matter inside this module; callers work in rectangles,
+/// like the rest of the app.
+pub fn wallpaper_monitors() -> Vec<ScreenRect> {
+    let Some(dw) = desktop_wallpaper() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let count = dw.GetMonitorDevicePathCount().unwrap_or(0);
+        for i in 0..count {
+            let Ok(id) = dw.GetMonitorDevicePathAt(i) else {
+                continue;
+            };
+            let id = take_pwstr(id);
+            let id_w = wide(&id);
+            let Ok(r) = dw.GetMonitorRECT(PCWSTR(id_w.as_ptr())) else {
+                continue;
+            };
+            out.push(ScreenRect {
+                x: r.left,
+                y: r.top,
+                w: r.right - r.left,
+                h: r.bottom - r.top,
+            });
+        }
+    }
+    out
+}
+
+/// The shell's id for the display at `rect`. Exact rectangle first, then the
+/// nearest by centre, in case the two sides round a DPI-scaled monitor
+/// differently.
+fn monitor_id_for(dw: &IDesktopWallpaper, rect: ScreenRect) -> Option<String> {
+    let mut nearest: Option<(i64, String)> = None;
+    unsafe {
+        let count = dw.GetMonitorDevicePathCount().ok()?;
+        for i in 0..count {
+            let Ok(id) = dw.GetMonitorDevicePathAt(i) else {
+                continue;
+            };
+            let id = take_pwstr(id);
+            let id_w = wide(&id);
+            let Ok(r) = dw.GetMonitorRECT(PCWSTR(id_w.as_ptr())) else {
+                continue;
+            };
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            if r.left == rect.x && r.top == rect.y && w == rect.w && h == rect.h {
+                return Some(id);
+            }
+            let dx = ((r.left + r.right) / 2 - (rect.x + rect.w / 2)) as i64;
+            let dy = ((r.top + r.bottom) / 2 - (rect.y + rect.h / 2)) as i64;
+            let d = dx * dx + dy * dy;
+            if nearest.as_ref().is_none_or(|(best, _)| d < *best) {
+                nearest = Some((d, id));
+            }
+        }
+    }
+    nearest.map(|(_, id)| id)
+}
+
+/// The wallpaper one display currently has, so the shelf can open focused on
+/// it. A monitor that has never had one of its own reports the global image.
+pub fn monitor_wallpaper(rect: ScreenRect) -> Option<String> {
+    let dw = desktop_wallpaper()?;
+    let id = monitor_id_for(&dw, rect)?;
+    let id_w = wide(&id);
+    let p = unsafe { dw.GetWallpaper(PCWSTR(id_w.as_ptr())).ok()? };
+    let s = take_pwstr(p);
+    (!s.is_empty()).then_some(s)
+}
+
+/// Sets the wallpaper on **one** display, leaving the others alone. Returns
+/// false when the per-monitor API is unavailable, so the caller can fall back
+/// to the global call.
+pub fn set_monitor_wallpaper(rect: ScreenRect, path: &Path) -> bool {
+    let Some(dw) = desktop_wallpaper() else {
+        return false;
+    };
+    let Some(id) = monitor_id_for(&dw, rect) else {
+        return false;
+    };
+    let id_w = wide(&id);
+    let path_w = wide(&wallpaper_path(path));
+    unsafe {
+        // The same "fill" the global path writes into the registry.
+        let _ = dw.SetPosition(DWPOS_FILL);
+        dw.SetWallpaper(PCWSTR(id_w.as_ptr()), PCWSTR(path_w.as_ptr()))
+            .is_ok()
     }
 }
 
@@ -969,4 +1092,3 @@ pub fn claim_first_run() -> bool {
     }
     reg_set_dword(APP_KEY, SEEN_INTRO, 1)
 }
-
