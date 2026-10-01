@@ -79,6 +79,11 @@ Details that matter:
   waits for Enter or a click, and Esc (or a click on the shelf) still cancels.
   Choosing **Next wallpaper** while it is open just rotates the carousel, since
   that reads as browsing rather than as an instruction to land.
+- The shelf opens on the display the **pointer** is on, not the one it was
+  launched on, so on two monitors you can hold Shift on either of them. On a
+  **portrait** monitor the cards are sized from the monitor's short side (its
+  width), which keeps the shelf in proportion instead of stretching top to
+  bottom.
 
 ## Project layout
 
@@ -299,6 +304,13 @@ Windows to swallow quickly, and it is skipped entirely when the source is not
 bigger than the screen — a copy of an image that Windows would have to *upscale*
 anyway adds a second JPEG generation for nothing, so small wallpapers are handed
 over untouched.
+
+The size a monitor copy is built for is the display the pointer is on when the
+shelf opens (and again whenever the monitor layout changes), so the copy follows
+you from one screen to the other instead of being frozen at the one from launch.
+Windows paints the single wallpaper across every monitor with the chosen fit, so
+on a mixed landscape/portrait pair the copy can only be exact for the display it
+was sized for; the other crops it.
 
 ## Performance
 
@@ -528,7 +540,7 @@ The look is a handful of constants, all of them named:
 | `main.rs` `Liquid` | The liquid's shape: meniscus taper, ripple and sway, stream width, bulge size and speed |
 | `main.rs` `build_geometry` | Card scale, lift, shear, stagger, cull distance, and how far the cards ride the surface |
 | `main.rs` `make_layout` | Card size, spacing, corner radius |
-| `main.rs` `strip_for` | Shelf height and vertical position |
+| `main.rs` `strip_for`, `short_side` | Shelf height and vertical position; which monitor dimension the cards are sized from |
 | `main.rs` `palette_for` | How much the accent tints the shelf |
 | `canvas.rs` `draw_shelf` | Wash shading (top → bottom) and accent mix |
 | `canvas.rs` `fill_profile` | How a row of the liquid is coloured and anti-aliased |
@@ -536,11 +548,15 @@ The look is a handful of constants, all of them named:
 
 ## Gotchas and limitations
 
-- **Single monitor.** The shelf appears on the monitor holding the cursor;
-  Windows applies the wallpaper to all of them. The prepared copies are sized to
-  that monitor too, so on a second monitor with a different aspect Windows crops
-  the copy rather than the original. It still fills correctly, just from an image
-  that was already cropped once.
+- **Multiple monitors, one wallpaper.** The shelf appears on whichever display
+  holds the pointer when it opens — a portrait panel included, where the cards
+  are sized from the monitor's short side — and the prepared copy handed to
+  Windows is sized for that same display. Windows still applies a single
+  wallpaper to all of them, though, so with displays of different shapes the
+  other monitor crops that copy rather than the original. It fills correctly;
+  it is just one JPEG generation from an image already cropped once. The shell's
+  simple wallpaper call only takes one file, so there is no way to hand it a
+  copy per monitor without going through the slideshow plumbing instead.
 - **The prepared copies are disk, not memory.** Roughly 0.9 MB per wallpaper ever
   *shown* — ~0.3 MB of lossless card copy plus ~0.6 MB of monitor-sized copy — in
   `%LOCALAPPDATA%\carasoul\cache`. Monitor copies are only made for the cards

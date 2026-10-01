@@ -71,21 +71,29 @@ struct Layout {
     radius: f32,
 }
 
-fn card_size(mon_h: i32) -> f32 {
-    (mon_h as f32 * 0.19).round().max(90.0)
+/// The dimension the shelf is proportioned by: the monitor's short side. On a
+/// landscape display that is its height, exactly as it always was; on a
+/// **portrait** one it is the width, which keeps the cards from towering over a
+/// screen that is only about a card and a half wide.
+fn short_side(mon: sys::ScreenRect) -> i32 {
+    mon.w.min(mon.h)
+}
+
+fn card_size(span: i32) -> f32 {
+    (span as f32 * 0.19).round().max(90.0)
 }
 
 /// Thumbnails are decoded to at least the size the focused card is drawn at, so
 /// nothing is ever upscaled (which is what made them look soft).
-fn thumb_size_for(mon_h: i32) -> (u32, u32) {
-    let card_h = card_size(mon_h);
+fn thumb_size_for(span: i32) -> (u32, u32) {
+    let card_h = card_size(span);
     let want = (card_h * 1.6 * 1.40).round() as u32;
     let w = ((want + 7) / 8 * 8).clamp(library::MIN_THUMB_W, library::MAX_THUMB_W);
     (w, w * 5 / 8)
 }
 
 fn strip_for(mon: sys::ScreenRect) -> Strip {
-    let card_h = card_size(mon.h);
+    let card_h = card_size(short_side(mon));
     // Kept as tight as the shelf allows: every pixel here is redrawn each frame.
     let h = (card_h * 2.25).round() as i32;
     let cy_screen = mon.y as f32 + mon.h as f32 * 0.58;
@@ -422,7 +430,49 @@ impl App {
         }
     }
 
+    /// Points the shelf at the display the pointer is on, and sizes the prepared
+    /// wallpaper copies to match. Windows paints the one wallpaper across every
+    /// monitor, but the shelf is only ever a band on one of them — the one being
+    /// worked on — so on a mixed setup (a widescreen plus a portrait panel, say)
+    /// both the band and the copy Windows is handed are built for that display
+    /// rather than for whichever monitor happened to hold the pointer at launch.
+    ///
+    /// Returns true when the band moved or changed size, i.e. when what is on
+    /// screen no longer reflects the strip that was just computed.
+    fn retarget_monitor(&mut self) -> bool {
+        let mon = sys::monitor_rect_at(sys::cursor_pos());
+        let strip = strip_for(mon);
+
+        // The copies are handed to Windows for the display being filled, so their
+        // size follows the display the pointer is on. A copy built for the other
+        // screen simply stops matching (and is swept later) — no need to delete it.
+        self.ready_w = mon.w.max(1) as u32;
+        self.ready_h = mon.h.max(1) as u32;
+        self.lib.ready_w = self.ready_w;
+        self.lib.ready_h = self.ready_h;
+
+        let moved = strip.x != self.strip.x || strip.y != self.strip.y;
+        let resized = strip.w != self.strip.w || strip.h != self.strip.h;
+        if !moved && !resized {
+            return false;
+        }
+        self.overlay.hide();
+        self.showing = false;
+        if resized && self.overlay.resize(strip.w, strip.h).is_err() {
+            // Better to keep the old band than to paint into a bitmap of the wrong
+            // size; the next open will try again.
+            return false;
+        }
+        self.strip = strip;
+        self.layout = make_layout(&self.strip);
+        self.needs_paint = true;
+        true
+    }
+
     fn open_strip(&mut self, pinned: bool) {
+        // Follow the pointer first, so a shelf opened on the second monitor is
+        // built (and its copies sized) for that monitor from the very first frame.
+        self.retarget_monitor();
         // Re-read the folder here rather than watching it: someone who drops an
         // image in and holds Shift should see it, and this costs one directory
         // listing when nothing has changed.
@@ -1243,7 +1293,7 @@ fn main() {
     // The tray icon is the app's front door: everything else is invisible.
     let tray_hwnd = overlay.hwnd;
 
-    let (thumb_w, thumb_h) = thumb_size_for(mon.h);
+    let (thumb_w, thumb_h) = thumb_size_for(short_side(mon));
     let lib = Library::load(
         dir,
         current.as_deref(),
@@ -1356,24 +1406,11 @@ fn main() {
             app.tray_command(cmds);
         }
         if pump.display_changed {
-            let mon = sys::monitor_rect_at(sys::cursor_pos());
-            let strip = strip_for(mon);
-            // The pre-transcoded copies are monitor-sized; anything already in the
-            // cache for the old size simply stops matching (and is swept later),
-            // while the ones built from here on use the new size.
-            app.ready_w = mon.w.max(1) as u32;
-            app.ready_h = mon.h.max(1) as u32;
-            app.lib.ready_w = app.ready_w;
-            app.lib.ready_h = app.ready_h;
-            if strip.w != app.strip.w || strip.h != app.strip.h {
-                app.overlay.hide();
-                app.showing = false;
-                if app.overlay.resize(strip.w, strip.h).is_ok() {
-                    app.strip = strip;
-                    app.layout = make_layout(&app.strip);
-                    app.needs_paint = true;
-                }
-            }
+            // Monitors were added, removed or rearranged. Re-point the shelf at
+            // whatever the pointer is over now and re-size the copies to match;
+            // entries cached for the old size simply stop matching and are swept
+            // once they age out.
+            app.retarget_monitor();
         }
 
         if app.demo && !announced && app.keys_grabbed {
