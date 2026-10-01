@@ -96,7 +96,10 @@ Details that matter:
 | `src/tray.rs` | The notification-area icon: its menu, its balloon, and the messages that come back from the shell |
 | `build.rs` | Writes the `.rc` for the icon + version info and compiles it with the SDK's `rc.exe` (see **Building**) |
 | `assets/` | The icon export, plus the generated `carasoul.ico` |
+| `dist/` | The build outputs that get handed out: `carasoul.exe` and `setup.exe` |
 | `tools/make_icon.py` | Regenerates `carasoul.ico` from the export (needs Pillow) |
+| `tools/make_setup.py` | Packs `dist/setup.exe` from the release build with IExpress |
+| `tools/setup/` | The installer payload: `install.cmd` and `uninstall.cmd` |
 | `wallpapers/` | The images. Drop new ones in and open the shelf; no restart needed |
 
 ## How it works
@@ -452,6 +455,41 @@ A GNU toolchain also works: `rustup target add x86_64-pc-windows-gnu` plus a
 MinGW-w64 `gcc` on `PATH`, then `--target x86_64-pc-windows-gnu`. The icon
 resource is wired up for MSVC only (GNU would need `windres`); the build still
 succeeds there, just without the file icon.
+
+### The release build and setup.exe
+
+`dist/` holds what gets handed out: `carasoul.exe` (the release build, runnable
+as-is) and `setup.exe`. Both are committed, so a checkout can hand them over
+without a toolchain; to rebuild them:
+
+```
+cargo build --release
+python tools/make_setup.py
+```
+
+`make_setup.py` is just a packer: it copies the release exe next to the two
+scripts in `tools/setup/` and drives **IExpress**, the self-extracting package
+builder that ships with Windows. There is no installer framework to install,
+which is the whole reason for the choice — the payload is one exe and two
+scripts.
+
+`setup.exe` installs **per-user**, so it never asks for elevation: it stops a
+running copy, drops `carasoul.exe` and `uninstall.cmd` into
+`%LOCALAPPDATA%\Programs\carasoul`, adds Start Menu shortcuts (the app and an
+uninstaller) plus a desktop shortcut, and starts the app once so it registers
+its startup entry. The uninstaller takes those back out and clears the cache,
+but it **leaves `wallpapers/` alone**: the app looks for that folder next to
+its exe, so people do keep their collection there.
+
+Two IExpress quirks are worth knowing if the packaging is ever touched:
+
+- Batch files must be **CRLF**. cmd.exe misparses LF-only scripts (multi-line
+  blocks especially), and the payload runs straight from the working tree, so
+  `make_setup.py` normalises the line endings and `.gitattributes` pins the
+  checkout to CRLF.
+- Running the package with `/Q` does not run the payload on this setup, even
+  with the quiet commands filled in. The installer is meant to be run normally;
+  there is no working silent switch.
 
 ## Command line
 

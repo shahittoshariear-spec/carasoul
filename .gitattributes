@@ -1,0 +1,5 @@
+# cmd.exe misparses LF-only batch files, especially multi-line blocks, and
+# tools/make_setup.py packs the installer payload straight from the working
+# tree. Keep batch files CRLF in the repo and in every checkout.
+*.cmd text eol=crlf
+*.bat text eol=crlf
