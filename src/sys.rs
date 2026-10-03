@@ -5,6 +5,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::Mutex;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GENERIC_WRITE, HINSTANCE, HWND,
@@ -29,7 +30,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_DWORD,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_MULTI_SZ,
     REG_OPEN_CREATE_OPTIONS, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Threading::{
@@ -455,11 +456,20 @@ pub struct Overlay {
 /// running and hand it the request that brought the user here.
 pub const WINDOW_CLASS: &str = "CarasoulOverlay";
 
+/// `WM_DISPLAYCHANGE` is **sent** to the window proc, not posted, so the frame
+/// loop's queue never sees it. The proc records it here instead and `pump`
+/// picks it up, the same way the tray messages work.
+static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
+
 /// The tray icon's callback messages, the tray's menu commands and every other
 /// message that lands on our window come through here first; anything the tray
-/// does not claim is the window's own business (which is nothing, so far).
+/// does not claim is the window's own business.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if crate::tray::handle_message(hwnd, msg, w, l) {
+        return LRESULT(0);
+    }
+    if msg == WM_DISPLAYCHANGE {
+        DISPLAY_CHANGED.store(true, Ordering::Relaxed);
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
@@ -659,6 +669,9 @@ impl Overlay {
     /// queue still has to be emptied so the system does not pile messages up.
     pub fn pump(&self) -> Pump {
         let mut out = Pump::default();
+        // Sent messages never reach the queue, so this one is collected from the
+        // window proc's flag rather than the loop below.
+        out.display_changed = DISPLAY_CHANGED.swap(false, Ordering::Relaxed);
         let mut msg = MSG::default();
         loop {
             let got = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) };
@@ -772,6 +785,76 @@ fn reg_get_str(subkey: &str, name: &str) -> Option<String> {
             .trim_end_matches('\0')
             .to_string(),
     )
+}
+
+/// Writes a REG_MULTI_SZ: each string NUL-terminated, then a final NUL.
+fn reg_set_multi(subkey: &str, name: &str, values: &[String]) -> bool {
+    let mut data = Vec::new();
+    for v in values {
+        for c in v.encode_utf16() {
+            data.extend_from_slice(&c.to_le_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+    }
+    data.extend_from_slice(&[0, 0]);
+    reg_set(subkey, name, REG_MULTI_SZ, &data)
+}
+
+/// Reads a REG_MULTI_SZ; empty when the key or value is not there. Asks for the
+/// size first, because a monitor device path next to a wallpaper path is easily
+/// past the fixed buffer `reg_get` uses.
+fn reg_get_multi(subkey: &str, name: &str) -> Vec<String> {
+    unsafe {
+        let mut h = HKEY::default();
+        let sk = wide(subkey);
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(sk.as_ptr()),
+            None,
+            KEY_READ,
+            &mut h,
+        ) != ERROR_SUCCESS
+        {
+            return Vec::new();
+        }
+        let n = wide(name);
+        let mut ty = REG_VALUE_TYPE::default();
+        let mut cb = 0u32;
+        let rc = RegQueryValueExW(
+            h,
+            PCWSTR(n.as_ptr()),
+            None,
+            Some(&mut ty),
+            None,
+            Some(&mut cb),
+        );
+        if rc != ERROR_SUCCESS || ty != REG_MULTI_SZ || cb == 0 {
+            let _ = RegCloseKey(h);
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; cb as usize];
+        let rc = RegQueryValueExW(
+            h,
+            PCWSTR(n.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(buf.as_mut_ptr()),
+            Some(&mut cb),
+        );
+        let _ = RegCloseKey(h);
+        if rc != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        buf.truncate(cb as usize);
+        let u16s: Vec<u16> = buf
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        u16s.split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf16_lossy(s))
+            .collect()
+    }
 }
 
 /// Reads a DWORD value; `None` when the key or value is not there.
@@ -987,10 +1070,13 @@ pub fn monitor_wallpaper(rect: ScreenRect) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Sets the wallpaper on **one** display, leaving the others alone. Returns
-/// false when the per-monitor API is unavailable, so the caller can fall back
-/// to the global call.
-pub fn set_monitor_wallpaper(rect: ScreenRect, path: &Path) -> bool {
+/// Sets the wallpaper on **one** display, leaving the others alone, and records
+/// `source` as that display's wallpaper. The source, not the prepared copy: the
+/// cache is swept, and a restore has to still find a file.
+///
+/// Returns false when the per-monitor API is unavailable, so the caller can
+/// fall back to the global call.
+pub fn set_monitor_wallpaper(rect: ScreenRect, path: &Path, source: &Path) -> bool {
     let Some(dw) = desktop_wallpaper() else {
         return false;
     };
@@ -999,12 +1085,95 @@ pub fn set_monitor_wallpaper(rect: ScreenRect, path: &Path) -> bool {
     };
     let id_w = wide(&id);
     let path_w = wide(&wallpaper_path(path));
-    unsafe {
+    let set = unsafe {
         // The same "fill" the global path writes into the registry.
         let _ = dw.SetPosition(DWPOS_FILL);
         dw.SetWallpaper(PCWSTR(id_w.as_ptr()), PCWSTR(path_w.as_ptr()))
             .is_ok()
+    };
+    if set {
+        remember_wallpaper(&id, &wallpaper_path(source));
     }
+    set
+}
+
+// ---------------------------------------------------------------------------
+// remembering what each display was given
+// ---------------------------------------------------------------------------
+
+/// Registry value holding the per-display wallpapers, as alternating device
+/// path and image path strings.
+const MONITORS: &str = "Monitors";
+
+/// Serialises the read-modify-write of that value.
+static REG_LOCK: Mutex<()> = Mutex::new(());
+
+/// The wallpapers this app last set, as `(device path, image path)` pairs.
+fn remembered_wallpapers() -> Vec<(String, String)> {
+    reg_get_multi(APP_KEY, MONITORS)
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect()
+}
+
+fn remember_wallpaper(id: &str, path: &str) {
+    let _guard = REG_LOCK.lock();
+    let mut pairs = remembered_wallpapers();
+    match pairs.iter_mut().find(|(mid, _)| mid == id) {
+        Some((_, p)) => *p = path.to_string(),
+        None => pairs.push((id.to_string(), path.to_string())),
+    }
+    let flat: Vec<String> = pairs
+        .into_iter()
+        .flat_map(|(id, path)| [id, path])
+        .collect();
+    reg_set_multi(APP_KEY, MONITORS, &flat);
+}
+
+/// Drops the notes: the global call has just put one image on every monitor, so
+/// there is no per-display choice left to restore.
+pub fn forget_monitor_wallpapers() {
+    let _guard = REG_LOCK.lock();
+    let _ = reg_delete(APP_KEY, MONITORS);
+}
+
+/// Puts each display's remembered wallpaper back when the shell has something
+/// else there.
+///
+/// Windows does not keep a monitor's individual wallpaper when the monitor is
+/// switched off (or unplugged) and comes back: the returning screen is handed
+/// the global image, cropped to its shape. The app keeps its own note, so this
+/// can put the right image back. Called after a display change, several times,
+/// because the shell can take a moment to list the returning monitor.
+pub fn restore_monitor_wallpapers() {
+    let remembered = remembered_wallpapers();
+    if remembered.is_empty() {
+        return;
+    }
+    let Some(dw) = desktop_wallpaper() else {
+        return;
+    };
+    for (id, path) in remembered {
+        let id_w = wide(&id);
+        let Ok(cur) = (unsafe { dw.GetWallpaper(PCWSTR(id_w.as_ptr())) }) else {
+            // Not connected right now; a later attempt may find it.
+            continue;
+        };
+        if same_path(&take_pwstr(cur), &path) {
+            continue;
+        }
+        let path_w = wide(&path);
+        unsafe {
+            let _ = dw.SetPosition(DWPOS_FILL);
+            let _ = dw.SetWallpaper(PCWSTR(id_w.as_ptr()), PCWSTR(path_w.as_ptr()));
+        }
+    }
+}
+
+/// Paths that differ only in case or the `\\?\` prefix are the same image.
+fn same_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.strip_prefix(r"\\?\").unwrap_or(s).to_ascii_lowercase();
+    norm(a) == norm(b)
 }
 
 /// Best-effort "PC theme follows the wallpaper": writes the undocumented DWM

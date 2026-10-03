@@ -284,6 +284,16 @@ behaviour: one image on every monitor.
 The accent colour is the one thing still shared: Windows has a single accent, so
 it follows whichever display was applied last.
 
+The app also keeps its **own note** of what it set on each display
+(`HKCU\Software\Carasoul\Monitors`, keyed by the monitor's device path).
+Windows does not keep a monitor's individual wallpaper when that monitor is
+switched off or unplugged: the returning screen is handed the global image,
+cropped to its shape. The note is what lets the app put the right image back —
+after a display change (a few times over a few seconds, because the shell can
+take a moment to list the returning monitor), at startup, and whenever the shelf
+opens. It always points at the original image, never the prepared copy, because
+the cache is swept.
+
 The broadcast is the slow part — hundreds of milliseconds — and Windows
 transcodes the image it is given before any of it reaches the desktop, so the
 apply runs on a **separate thread**, letting the overlay finish its animation
@@ -528,7 +538,8 @@ of hotkeys claimed and whether the hook installed.
 with its position, size and current wallpaper, straight from the shell. If the
 shelf lands on the wrong screen, compare that list with where the shelf appears.
 `--apply` deliberately uses the **global** call, so it puts the one image on
-every monitor; the per-monitor path is what the shelf itself uses.
+every monitor and clears the per-display notes; the per-monitor path is what the
+shelf itself uses.
 
 ## Wallpapers
 
@@ -604,13 +615,22 @@ The look is a handful of constants, all of them named:
 ## Gotchas and limitations
 
 - **Two monitors, two wallpapers.** Each display keeps its own image, set
-  through the shell's `IDesktopWallpaper` interface and remembered by Windows
-  across restarts. The shelf applies to whichever display it was opened on, and
-  the prepared copy is sized for that same display. Two things are still
-  shared: the **accent colour**, which follows whichever monitor was applied
-  last because Windows only has one, and `--apply` on the command line, which is
-  the global call and puts one image on every monitor (handy as a reset,
-  surprising if you did not mean it).
+  through the shell's `IDesktopWallpaper` interface. Windows drops a monitor's
+  individual wallpaper when the monitor goes away (switched off, unplugged) and
+  hands the returning screen the global image, cropped — so the app keeps its
+  own note per display and puts the right image back on a display change, at
+  startup, and when the shelf opens. Because of that, the app owns the
+  wallpapers it set: changing one from Windows' own Settings is taken back the
+  next time the shelf opens on that screen.
+- Two things are still shared: the **accent colour**, which follows whichever
+  monitor was applied last because Windows only has one, and `--apply` on the
+  command line, which is the global call and puts one image on every monitor
+  (it drops the per-display notes too, so it doubles as a reset).
+- **`WM_DISPLAYCHANGE` is sent, not posted.** It reaches the window proc
+  directly, so `PeekMessage` never sees it and the frame loop cannot act on it
+  from the queue. The proc records it in an atomic for `pump` to pick up, the
+  same way the tray messages work; anything else that has to notice a display
+  change has to go through that flag.
 - **The per-monitor API can be missing.** It exists from Windows 8 on. If COM or
   the interface is unavailable the app falls back to the global
   `SPI_SETDESKWALLPAPER` call, which is the old behaviour: one image everywhere.

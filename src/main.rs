@@ -475,6 +475,10 @@ impl App {
     }
 
     fn open_strip(&mut self, pinned: bool) {
+        // A screen that was off may have been handed the global image; put its
+        // own back before reading what it has, so the shelf opens focused on
+        // the wallpaper that display is supposed to be showing.
+        sys::restore_monitor_wallpapers();
         // Follow the pointer first, so a shelf opened on the second monitor is
         // built (and its copies sized) for that monitor from the very first frame.
         if self.retarget_monitor() {
@@ -689,7 +693,7 @@ impl App {
                 let target = ready.as_deref().unwrap_or(&path);
                 // One display at a time; the global call is the fallback for a
                 // shell that has no per-monitor API to offer.
-                if !sys::set_monitor_wallpaper(mon, target) {
+                if !sys::set_monitor_wallpaper(mon, target, &path) {
                     sys::set_wallpaper(target);
                 }
                 if let Some(a) = accent {
@@ -1275,7 +1279,10 @@ fn main() {
     if monitors {
         for rect in sys::wallpaper_monitors() {
             let cur = sys::monitor_wallpaper(rect).unwrap_or_else(|| "(none)".to_string());
-            println!("{:>6},{:>6}  {}x{}  {}", rect.x, rect.y, rect.w, rect.h, cur);
+            println!(
+                "{:>6},{:>6}  {}x{}  {}",
+                rect.x, rect.y, rect.w, rect.h, cur
+            );
         }
         return;
     }
@@ -1299,6 +1306,9 @@ fn main() {
         };
         println!("applying {}", item.name);
         sys::set_wallpaper(&item.path);
+        // The global call has just put one image on every monitor, so there is
+        // no per-display choice left for the app to restore.
+        sys::forget_monitor_wallpapers();
         if let Some(a) = library::accent_of(&item.path) {
             println!("accent: #{:02X}{:02X}{:02X}", a[0], a[1], a[2]);
             sys::apply_accent((a[0], a[1], a[2]));
@@ -1407,6 +1417,10 @@ fn main() {
     tray::set_has_wallpapers(!app.lib.is_empty());
     app.update_tooltip();
     if !preview {
+        // Windows can hand a monitor the global image while the app is not
+        // looking — a screen that was off at logon, say — so put the remembered
+        // per-display wallpapers back once at startup.
+        sys::restore_monitor_wallpapers();
         // Started last, so the icon appears already carrying its tooltip.
         tray::init(tray_hwnd);
         if sys::claim_first_run() {
@@ -1437,6 +1451,11 @@ fn main() {
     let mut loops = 0u32;
     let mut sample_at = Instant::now();
     let mut announced = false;
+    // A returning monitor gets the global image from Windows; the app puts its
+    // own back, a few times over a few seconds, because the shell can take a
+    // moment to list the monitor again.
+    let mut restore_left = 0u8;
+    let mut restore_at = Instant::now();
     loop {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().clamp(0.0, 0.1);
@@ -1459,6 +1478,13 @@ fn main() {
             // entries cached for the old size simply stop matching and are swept
             // once they age out.
             app.retarget_monitor();
+            restore_left = 6;
+            restore_at = now + Duration::from_millis(200);
+        }
+        if restore_left > 0 && now >= restore_at {
+            sys::restore_monitor_wallpapers();
+            restore_left -= 1;
+            restore_at = now + Duration::from_millis(700);
         }
 
         if app.demo && !announced && app.keys_grabbed {
